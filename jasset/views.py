@@ -1,13 +1,30 @@
 # coding:utf-8
 
 import ast
+import base64
+import time
+import sys
+
+reload(sys)
+sys.setdefaultencoding('utf-8')
 
 from django.db.models import Q
 from django.template import RequestContext
 from django.shortcuts import get_object_or_404
+from django.db import connection, transaction
 
 from jperm.models import Perm
 from jumpserver.api import *
+from jasset.models import ImageGroup 
+from jasset.models import NetworkGroup 
+
+# ucloud driver import method
+from datatransfer import createnode
+from datatransfer import listonenode
+from datatransfer import shutdownnode
+from datatransfer import deletenode
+from datatransfer import resetnode
+from datatransfer import restartnode
 
 cryptor = PyCrypt(KEY)
 
@@ -28,7 +45,8 @@ def get_host_groups(groups):
         if group:
             group = group[0]
             ret.append(group)
-    group_all = get_object_or_404(BisGroup, name='ALL')
+    #group_all = get_object_or_404(BisGroup, name='ALL')
+    group_all = get_object(BisGroup, name='All')
     ret.append(group_all)
     return ret
 
@@ -44,30 +62,35 @@ def get_host_depts(depts):
     return ret
 
 
-def db_host_insert(host_info, username='', password=''):
+def db_host_insert(host_info,HostId, username='', password=''):
     """ 添加主机时数据库操作函数 """
-    ip, port, idc, jtype, group, dept, active, comment = host_info
+    name, ssh_port,hard_disk,memory, cpu, idc,jtype,  group, dept, active, comment = host_info
+    host_id = HostId
     idc = IDC.objects.filter(id=idc)
     if idc:
         idc = idc[0]
     if jtype == 'M':
-        password = cryptor.encrypt(password)
-        a = Asset(ip=ip, port=port,
+        password = base64.b64encode(password)
+        a = Asset(name=name, ssh_port=ssh_port,
+		  hard_disk=hard_disk,cpu=cpu,memory=memory,
                   login_type=jtype, idc=idc,
+		  host_id=host_id,
                   is_active=int(active),
                   comment=comment,
                   username=username,
                   password=password)
     else:
-        a = Asset(ip=ip, port=port,
+        a = Asset(name=name, ssh_port=ssh_port,
+		  hard_disk=hard_disk,cpu=cpu,memory=memory,
                   login_type=jtype, idc=idc,
+		  host_id = host_id,
                   is_active=int(active),
                   comment=comment)
     a.save()
 
-    all_group = BisGroup.objects.get(name='ALL')
+    #all_group = BisGroup.objects.get(name='ALL')
     groups = get_host_groups(group)
-    groups.append(all_group)
+    #groups.append(all_group)
 
     depts = get_host_depts(dept)
 
@@ -75,17 +98,20 @@ def db_host_insert(host_info, username='', password=''):
     a.dept = depts
     a.save()
 
-
 def db_host_update(host_info, username='', password=''):
     """ 修改主机时数据库操作函数 """
-    ip, port, idc, jtype, group, dept, active, comment, host = host_info
+    name, ip,memory, cpu, hard_disk, ssh_port, idc, jtype, group, dept, active, comment, host = host_info
     idc = IDC.objects.filter(id=idc)
     if idc:
         idc = idc[0]
     groups = get_host_groups(group)
     depts = get_host_depts(dept)
+    host.name = name
     host.ip = ip
-    host.port = port
+    host.memory = memory
+    host.cpu = cpu
+    host.hard_disk = hard_disk
+    host.ssh_port = ssh_port
     host.login_type = jtype
     host.idc = idc
     host.is_active = int(active)
@@ -93,7 +119,7 @@ def db_host_update(host_info, username='', password=''):
 
     if jtype == 'M':
         if password != host.password:
-            password = cryptor.encrypt(password)
+            password = base64.b64encode(password)
         host.password = password
         host.username = username
         host.password = password
@@ -128,7 +154,8 @@ def batch_host_edit(host_info, j_user='', j_password=''):
     j_idc = IDC.objects.get(name=j_idc)
     if j_type == 'M':
         if a.password != j_password:
-            j_password = cryptor.decrypt(j_password)
+            #j_password = cryptor.decrypt(j_password)
+            j_password = base64.b64decode(j_password)
         a.ip = j_ip
         a.port = j_port
         a.login_type = j_type
@@ -179,11 +206,14 @@ def db_idc_delete(request, idc_id):
 
 
 @require_admin
+#@commit
 def host_add(request):
     """ 添加主机 """
     header_title, path1, path2 = u'添加主机', u'资产管理', u'添加主机'
     login_types = {'L': 'LDAP', 'M': 'MAP'}
     eidc = IDC.objects.exclude(name='ALL')
+    eImageGroup = ImageGroup.objects.all()
+    eNetworkGroup = NetworkGroup.objects.all()
     if is_super_user(request):
         edept = DEPT.objects.all()
         egroup = BisGroup.objects.exclude(name='ALL')
@@ -192,34 +222,83 @@ def host_add(request):
         egroup = dept.bisgroup_set.all()
 
     if request.method == 'POST':
-        j_ip = request.POST.get('j_ip')
-        j_idc = request.POST.get('j_idc')
+        j_num = request.POST.get('j_multi')
+        j_name = request.POST.get('j_name')
         j_port = request.POST.get('j_port')
+	j_disk = request.POST.get('j_hard_disk')
+	j_memory = request.POST.get('j_memory')
+	j_cpu = request.POST.get('j_cpu')
+        j_idc = request.POST.get('j_idc')
+	j_region = request.POST.get('j_region')
+	j_imagename = request.POST.get('j_imagegroup')
+	j_subnetname = request.POST.get('j_networkgroup')
         j_type = request.POST.get('j_type')
-        j_group = request.POST.getlist('j_group')
+        j_group = request.POST.get('j_bisgroup')
         j_active = request.POST.get('j_active')
         j_comment = request.POST.get('j_comment')
 
         if is_super_user(request):
             j_dept = request.POST.getlist('j_dept')
-            host_info = [j_ip, j_port, j_idc, j_type, j_group, j_dept, j_active, j_comment]
+	    #第一次存入数据库的主机信息
+            host_info = [j_name, j_port, j_disk, j_memory, j_cpu, j_idc,  j_type, j_dept,j_group, j_active, j_comment]
         elif is_group_admin(request):
             j_dept = request.POST.get('j_dept')
-            host_info = [j_ip, j_port, j_idc, j_type, j_group, [j_dept], j_active, j_comment]
+            host_info = [j_name, j_port, j_disk, j_memory, j_cpu, j_idc, j_type, j_group, [j_dept], j_active, j_comment]
 
         if is_group_admin(request) and not validate(request, asset_group=j_group, edept=[j_dept]):
             return httperror(request, u'添加失败,您无权操作!')
 
-        if Asset.objects.filter(ip=str(j_ip)):
-            emg = u'该IP %s 已存在!' % j_ip
-            return my_render('jasset/host_add.html', locals(), request)
         if j_type == 'M':
             j_user = request.POST.get('j_user')
             j_password = request.POST.get('j_password', '')
-            db_host_insert(host_info, j_user, j_password)
-        else:
-            db_host_insert(host_info)
-        smg = u'主机 %s 添加成功' % j_ip
+	    #从页面接收到json中参数并新建主机
+	    Password=base64.b64encode(j_password)
+	    cursor = connection.cursor()
+	    #查询主机组的值
+	    cursor.execute('select name from jasset_bisgroup where id=%s', [j_group])	
+	    work_group = cursor.fetchone()[0]
+            #查询镜像ID
+            cursor.execute('select image_id from jasset_imagegroup where image_name=%s',[j_imagename])
+            ImageID = cursor.fetchone()[0]
+            #查询网络ID
+            cursor.execute('select subnet_id from jasset_networkgroup where subnet_name=%s',[j_subnetname])
+            SubnetID = cursor.fetchone()[0]
+            for i in range(int(j_num)):
+	        CreateHost = createnode.conn.create_node(Region=j_region,Name=str(j_name),ImageId=ImageID,ChargeType="",LoginMode="Password",Password=Password,KeyPair="",Tag=str(work_group),CPU=j_cpu,Memory=j_memory,DiskSpace=j_disk,NetworkId=SubnetID)	
+	    #数据二次入库(ip,失效时间，)
+	    results = json.loads(CreateHost)
+            print results
+            HostId = results["UHostIds"][0]
+            print HostId
+	    #数据库用户数据第一次插入
+	    db_host_insert(host_info,HostId, j_user, j_password)
+	    #数据二次入库(ip,磁盘数量，磁盘挂载点，系统版本，系统类型，失效时间)
+	    ListOneNode =listonenode.conn.list_one_node(HostId)
+            OneNodeList = json.loads(ListOneNode)
+            parent = OneNodeList["UHostSet"]
+            distros = []
+            for item in parent:
+                ISOTIMEFORMAT='%Y-%m-%d %H:%M:%S'
+                disknum = len(item["DiskSet"])
+                expiretime = datetime.datetime.utcfromtimestamp(item["ExpireTime"])
+                osname = item["OsName"].encode('utf-8')
+		memory =  (item["Memory"] / 1024)
+                ostype = item["OsType"]
+                state = item["State"]
+                ipinfo = item["IPSet"]
+                for item in ipinfo:
+                        ip = item["IP"]
+                        iptype = item["Type"]
+		
+                values_tuple = (ip,iptype,state,disknum,ostype,osname,expiretime)
+                distros.append(values_tuple)
+            time.sleep(3)
+            sql = 'update jasset_asset set ip=%s, ip_type=%s,memory=%s, status=%s, disk_number=%s, system=%s, system_version=%s, guarantee_date=%s where host_id=%s'
+	    cursor.execute(sql, [ip,iptype,memory,state,disknum,ostype,osname,expiretime,str(HostId)])
+	    transaction.commit()
+	else:
+            db_host_insert(host_info,HostId) 
+        smg = u'主机 %s 添加成功' % j_name
 
     return my_render('jasset/host_add.html', locals(), request)
 
@@ -271,8 +350,8 @@ def host_add_batch(request):
             if is_group_admin(request) and not validate(request, asset_group=group_ids, edept=dept_ids):
                 return httperror(request, '添加失败, 没有%s这个主机组' % group_name)
 
-            if Asset.objects.filter(ip=str(j_ip)):
-                return httperror(request, '添加失败, 改IP%s已存在' % j_ip)
+            #if Asset.objects.filter(i_ip)):
+             #   return httperror(request, '添加失败, 改IP%s已存在' % j_ip)
 
             host_info = [j_ip, j_port, j_idc, j_type, group_ids, dept_ids, j_active, j_comment]
             db_host_insert(host_info)
@@ -435,9 +514,23 @@ def host_del(request, offset):
     """ 删除主机 """
     if offset == 'multi':
         len_list = request.POST.get("len_list")
+        #获取数据库中对应的主机ID，并执行删除操作
+        id_list = []
         for i in range(int(len_list)):
             key = "id_list[" + str(i) + "]"
             host_id = request.POST.get(key)
+            id_list.append(host_id)
+            print id_list
+            for j in id_list:
+                cursor = connection.cursor()
+                cursor.execute('select host_id from jasset_asset where id=%s',[j])
+                HostId = cursor.fetchall()[0]
+                print HostId[0]
+                ShutdownNode = shutdownnode.conn.stop_node(HostId[0])
+                print ShutdownNode
+                time.sleep(12)
+                DelNode = deletenode.conn.delete_node(HostId[0])
+                print DelNode
             db_host_delete(request, host_id)
     else:
         db_host_delete(request, offset)
@@ -465,19 +558,32 @@ def host_edit(request):
     e_dept = post.dept.all()
 
     if request.method == 'POST':
+        j_name = request.POST.get('j_name', '')
         j_ip = request.POST.get('j_ip', '')
-        j_idc = request.POST.get('j_idc', '')
+        j_memory = request.POST.get('j_memory', '')
+        j_cpu = request.POST.get('j_cpu', '')
+        j_disk = request.POST.get('j_disk', '')
         j_port = request.POST.get('j_port', '')
+        j_idc = request.POST.get('j_idc', '')
         j_type = request.POST.get('j_type', '')
         j_dept = request.POST.getlist('j_dept', '')
         j_group = request.POST.getlist('j_group', '')
         j_active = request.POST.get('j_active', '')
         j_comment = request.POST.get('j_comment', '')
 
-        host_info = [j_ip, j_port, j_idc, j_type, j_group, j_dept, j_active, j_comment, post]
+        host_info = [j_name, j_ip,  j_memory, j_cpu, j_disk, j_port, j_idc, j_type, j_group, j_dept, j_active, j_comment, post]
         if j_type == 'M':
             j_user = request.POST.get('j_user')
             j_password = request.POST.get('j_password')
+            cursor = connection.cursor()
+            #查询主机组的值
+            cursor.execute('select host_id from jasset_asset where ip=%s', [j_ip])
+            HostId = cursor.fetchone()[0]
+            ShutdownNode = shutdownnode.conn.stop_node(HostId)
+            time.sleep(12)
+            #更改参数
+            ResetNode = resetnode.conn.reset_node(UHostId=HostId,Region=j_group,CPU=j_cpu,Memory=j_memory,DiskSpace=j_disk)
+            StartNode = restartnode.conn.reboot_node(HostId)
             db_host_update(host_info, j_user, j_password)
         else:
             db_host_update(host_info)
@@ -516,7 +622,7 @@ def host_edit_adm(request):
         j_active = request.POST.get('j_active')
         j_comment = request.POST.get('j_comment')
 
-        host_info = [j_ip, j_port, j_idc, j_type, j_group, j_dept, j_active, j_comment]
+        host_info = [ j_ip, j_port, j_idc, j_type, j_group, j_dept, j_active, j_comment]
 
         if not validate(request, asset_group=j_group, edept=j_dept):
             emg = u'修改失败,您无权操作!'
